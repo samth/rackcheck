@@ -7,6 +7,7 @@
          racket/random
          racket/stream
          "gen/syntax.rkt"
+         (only-in "gen/core.rkt" gen?)
          (submod "gen/shrink-tree.rkt" private))
 
 ;; property ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -15,9 +16,20 @@
  (rename-out [prop? property?]
              [prop-name property-name])
  property
- define-property)
+ define-property
+ ;; Public accessors for building custom check loops (e.g. coverage-guided).
+ ;; property-gen returns the generator that produces shrink-trees of arg lists.
+ ;; property-proc returns the test function applied to generated args.
+ (contract-out
+  [property-gen (-> prop? gen?)]
+  [property-proc (-> prop? procedure?)]
+  [property-arg-ids (-> prop? list?)]))
 
 (struct prop (name arg-ids g f))
+
+(define (property-gen p) (prop-g p))
+(define (property-proc p) (prop-f p))
+(define (property-arg-ids p) (prop-arg-ids p))
 
 (module+ private
   (provide (struct-out prop)))

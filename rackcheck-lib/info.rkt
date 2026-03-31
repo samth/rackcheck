@@ -4,5 +4,6 @@
 (define version "2.1.1")
 (define collection "rackcheck")
 (define deps '("base"
-               "rackunit-lib"))
+               "rackunit-lib"
+               "errortrace-lib"))
 (define build-deps '("rackunit-lib"))

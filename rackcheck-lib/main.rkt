@@ -9,4 +9,5 @@
            "gen/syntax.rkt"
            "gen/unicode.rkt"
            "prop.rkt"
-           "rackunit.rkt")
+           "rackunit.rkt"
+           "guided.rkt")
