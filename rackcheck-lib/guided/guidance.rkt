@@ -51,10 +51,21 @@
   (define g (property-gen p))
   (define f (property-proc p))
 
-  ;; Set up instrumentation
-  (setup-errortrace!)
-  (when target-path
-    (load-instrumented target-path))
+  ;; Set up instrumentation via namespace isolation.
+  ;; get-counts reads execute counts from the instrumented namespace.
+  ;; instrumented-ns is the namespace where the target was compiled with
+  ;; errortrace — we parameterize current-namespace to it when running
+  ;; the property so that dynamic-require calls in the property body
+  ;; resolve to the instrumented version of the target.
+  (define-values (get-counts instrumented-ns)
+    (if target-path
+        (let-values ([(ns gc) (make-instrumented-namespace target-path)])
+          (parameterize ([current-namespace ns])
+            (dynamic-require
+             (if (path? target-path) target-path (string->path target-path))
+             #f))
+          (values gc ns))
+        (values (lambda () '()) #f)))
 
   ;; Set up RNG
   (define rng (make-pseudo-random-generator))
@@ -70,9 +81,13 @@
 
   ;; Helper: run property on a list of arguments.
   ;; Returns (values passed? exception-or-#f)
+  ;; Runs in the instrumented namespace (if any) so that dynamic-require
+  ;; calls in the property body resolve to the instrumented target.
   (define (test-input args)
     (with-handlers ([exn:fail? (lambda (e) (values #f e))])
-      (parameterize ([current-pseudo-random-generator caller-rng])
+      (parameterize ([current-pseudo-random-generator caller-rng]
+                     [current-namespace
+                      (or instrumented-ns (current-namespace))])
         (if (apply f args)
             (values #t #f)
             (values #f #f)))))
@@ -154,9 +169,9 @@
             (define-values (a t) (generate-fresh (iter-size iteration)))
             (values a #f t)]))
 
-       (define before (snapshot-coverage))
+       (define before (snapshot-coverage get-counts))
        (define-values (passed? exn) (test-input args))
-       (define after (snapshot-coverage))
+       (define after (snapshot-coverage get-counts))
        (define diff (diff-coverage before after))
        (define sig (coverage-signature diff))
        (define sh (coverage-sig-hash sig))
@@ -197,7 +212,7 @@
   (define (make-result status iteration [args #f] [shrunk #f] [exn #f])
     (guided-result status iteration args shrunk exn
                    corp seed
-                   (snapshot-coverage)
+                   (snapshot-coverage get-counts)
                    total-new-points))
 
   (loop 0 #f))

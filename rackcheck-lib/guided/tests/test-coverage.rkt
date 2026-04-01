@@ -6,16 +6,6 @@
          racket/set
          rackcheck/guided/coverage)
 
-(test-case "setup-errortrace! enables instrumentation"
-  (setup-errortrace!)
-  ;; Should not error on repeated calls
-  (setup-errortrace!))
-
-(test-case "snapshot-coverage returns a hash"
-  (setup-errortrace!)
-  (define snap (snapshot-coverage))
-  (check-pred hash? snap))
-
 (test-case "diff-coverage computes positive deltas"
   (define before (hash '("f" 1 5) 3 '("f" 2 3) 0))
   (define after (hash '("f" 1 5) 5 '("f" 2 3) 2 '("f" 3 1) 1))
@@ -44,33 +34,30 @@
   (check-false (new-coverage? sig (set '("f" 1 5) '("f" 2 3)))))
 
 (test-case "count-crosses-threshold? detects power-of-2 crossings"
-  (define before (hash '("f" 1 5) 1))
-  (define after (hash '("f" 1 5) 2))
-  (check-true (count-crosses-threshold? before after))
-  (define before2 (hash '("f" 1 5) 2))
-  (define after2 (hash '("f" 1 5) 3))
-  (check-false (count-crosses-threshold? before2 after2))
-  (define after3 (hash '("f" 1 5) 4))
-  (check-true (count-crosses-threshold? before2 after3)))
+  (check-true (count-crosses-threshold? (hash '("f" 1 5) 1) (hash '("f" 1 5) 2)))
+  (check-false (count-crosses-threshold? (hash '("f" 1 5) 2) (hash '("f" 1 5) 3)))
+  (check-true (count-crosses-threshold? (hash '("f" 1 5) 2) (hash '("f" 1 5) 4))))
 
 (test-case "coverage-sig-hash is deterministic"
   (define sig (set '("f" 1 5) '("f" 2 3)))
-  (define h1 (coverage-sig-hash sig))
-  (define h2 (coverage-sig-hash sig))
-  (check-equal? h1 h2))
+  (check-equal? (coverage-sig-hash sig) (coverage-sig-hash sig)))
 
-(test-case "load-instrumented loads a module"
-  (setup-errortrace!)
+(test-case "make-instrumented-namespace loads and instruments a module"
   (with-output-to-file "/tmp/cov-test-mod.rkt" #:exists 'replace
     (lambda ()
       (displayln "#lang racket/base")
       (displayln "(provide foo)")
       (displayln "(define (foo x) (if (> x 0) 'pos 'neg))")))
-  (define mod-path (load-instrumented "/tmp/cov-test-mod.rkt"))
-  (define foo (dynamic-require mod-path 'foo))
-  (define before (snapshot-coverage))
+  (define-values (ns get-counts)
+    (make-instrumented-namespace "/tmp/cov-test-mod.rkt"))
+  (parameterize ([current-namespace ns])
+    (dynamic-require (string->path "/tmp/cov-test-mod.rkt") #f))
+  (define foo
+    (parameterize ([current-namespace ns])
+      (dynamic-require (string->path "/tmp/cov-test-mod.rkt") 'foo)))
+  (define before (snapshot-coverage get-counts))
   (foo 5)
-  (define after (snapshot-coverage))
+  (define after (snapshot-coverage get-counts))
   (define d (diff-coverage before after))
   (check-true (> (hash-count d) 0) "Should have coverage after calling foo"))
 
