@@ -12,14 +12,14 @@
 
 (test-case "corpus-add! adds entries"
   (define c (make-corpus))
-  (define entry (corpus-entry '(42) #t 5 0 #f (box 5.0) (box 0)))
+  (define entry (corpus-entry '(42) #t 5 0 #f (box 5.0) (box 0) #f))
   (corpus-add! c entry)
   (check-equal? (corpus-size c) 1))
 
 (test-case "corpus-pick returns an entry"
   (define c (make-corpus))
-  (corpus-add! c (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0)))
-  (corpus-add! c (corpus-entry '(2) #t 5 1 #f (box 5.0) (box 0)))
+  (corpus-add! c (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0) #f))
+  (corpus-add! c (corpus-entry '(2) #t 5 1 #f (box 5.0) (box 0) #f))
   (define rng (make-pseudo-random-generator))
   (parameterize ([current-pseudo-random-generator rng])
     (random-seed 42))
@@ -32,19 +32,19 @@
   (check-false (corpus-pick c rng)))
 
 (test-case "corpus-boost-energy! increases energy"
-  (define entry (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0)))
+  (define entry (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0) #f))
   (corpus-boost-energy! entry 5)
   (check-equal? (unbox (corpus-entry-energy entry)) 8.0))
 
 (test-case "corpus-decay-energy! decreases energy"
-  (define entry (corpus-entry '(1) #t 3 0 #f (box 10.0) (box 0)))
+  (define entry (corpus-entry '(1) #t 3 0 #f (box 10.0) (box 0) #f))
   (corpus-decay-energy! entry)
   (check-equal? (unbox (corpus-entry-energy entry)) 9.5))
 
 (test-case "power schedule favors high-energy entries"
   (define c (make-corpus))
-  (corpus-add! c (corpus-entry '(a) #t 10 0 #f (box 100.0) (box 0)))
-  (corpus-add! c (corpus-entry '(b) #t 1 1 #f (box 0.1) (box 10)))
+  (corpus-add! c (corpus-entry '(a) #t 10 0 #f (box 100.0) (box 0) #f))
+  (corpus-add! c (corpus-entry '(b) #t 1 1 #f (box 0.1) (box 10) #f))
   (define rng (make-pseudo-random-generator))
   (parameterize ([current-pseudo-random-generator rng])
     (random-seed 42))

@@ -14,7 +14,12 @@
  (contract-out
   [mutate-value (-> any/c pseudo-random-generator? any/c)]
   [splice-values (-> any/c any/c pseudo-random-generator? any/c)]
-  [mutate-list-structurally (-> list? pseudo-random-generator? list?)]))
+  [mutate-list-structurally (-> list? pseudo-random-generator? list?)])
+ mutate-value-near
+ mutate-with-dictionary
+ extend-with-dictionary)
+
+(define (exact-nonneg-integer? v) (and (exact-integer? v) (>= v 0)))
 
 ;; Dispatch mutation by type.
 (define (mutate-value val rng)
@@ -233,6 +238,187 @@
     (vector-set! vec i (vector-ref vec j))
     (vector-set! vec j tmp))
   (vector->list vec))
+
+;; ---------------------------------------------------------------------------
+;; Position-biased mutation: mutate near a specific position.
+;; Returns (values mutated-value actual-position-mutated).
+;;
+;; When a previous mutation at position P produced new coverage, future
+;; mutations should focus near P — extending it, trying adjacent
+;; characters, or making small edits in the same region.
+
+(define (mutate-value-near val hint-pos rng)
+  (cond
+    [(string? val) (mutate-string-near val hint-pos rng)]
+    [(list? val) (mutate-list-near val hint-pos rng)]
+    [else (values (mutate-value val rng) 0)]))
+
+;; String mutation biased around a position.
+;; Tries mutations within ±3 characters of hint-pos.
+(define (mutate-string-near val hint-pos rng)
+  (define len (string-length val))
+  (if (zero? len)
+      (values (string (integer->char (random 32 127 rng))) 0)
+      (let ()
+  ;; Clamp hint to valid range
+  (define pos (min hint-pos (sub1 len)))
+  ;; Pick a nearby position (within ±3)
+  (define nearby (max 0 (min (sub1 len) (+ pos (- (random 0 7 rng) 3)))))
+  (define strategies
+    (list
+     ;; Insert a char right after the hint position
+     (lambda ()
+       (define insert-at (min (add1 pos) len))
+       (define ch (integer->char (random 32 127 rng)))
+       (values (string-append (substring val 0 insert-at)
+                              (string ch)
+                              (substring val insert-at))
+               insert-at))
+     ;; Replace the char at/near the hint position
+     (lambda ()
+       (define ch (integer->char (random 32 127 rng)))
+       (values (string-append (substring val 0 nearby)
+                              (string ch)
+                              (substring val (min len (add1 nearby))))
+               nearby))
+     ;; Insert a copy of the char at hint-pos next to it (extend a pattern)
+     (lambda ()
+       (define ch (string-ref val pos))
+       (define insert-at (min (add1 pos) len))
+       (values (string-append (substring val 0 insert-at)
+                              (string ch)
+                              (substring val insert-at))
+               insert-at))
+     ;; Try a char that's close to the current one (±1 codepoint)
+     (lambda ()
+       (define old-ch (char->integer (string-ref val nearby)))
+       (define new-ch (max 32 (min 126 (+ old-ch (if (zero? (random 0 2 rng)) 1 -1)))))
+       (values (string-append (substring val 0 nearby)
+                              (string (integer->char new-ch))
+                              (substring val (min len (add1 nearby))))
+               nearby))
+     ;; Append a char at the end (grow the string)
+     (lambda ()
+       (define ch (integer->char (random 32 127 rng)))
+       (values (string-append val (string ch)) len))))
+  (define strategy (random-ref strategies rng))
+  (strategy))))
+
+;; List mutation biased around a position.
+(define (mutate-list-near val hint-pos rng)
+  (define len (length val))
+  (cond
+    [(zero? len) (values (list (mutate-value '() rng)) 0)]
+    [else
+     (define pos (min hint-pos (sub1 len)))
+     (define strategies
+       (list
+        ;; Mutate the element at the hint position
+        (lambda ()
+          (define v (list->vector val))
+          (vector-set! v pos (mutate-value (vector-ref v pos) rng))
+          (values (vector->list v) pos))
+        ;; Insert a mutated copy of the hint element next to it
+        (lambda ()
+          (define elem (mutate-value (list-ref val pos) rng))
+          (define insert-at (min (add1 pos) len))
+          (values (append (list-take val insert-at)
+                          (list elem)
+                          (list-drop val insert-at))
+                  insert-at))
+        ;; Replace a nearby element
+        (lambda ()
+          (define nearby (max 0 (min (sub1 len) (+ pos (- (random 0 5 rng) 2)))))
+          (define v (list->vector val))
+          (vector-set! v nearby (mutate-value (vector-ref v nearby) rng))
+          (values (vector->list v) nearby))))
+     ((random-ref strategies rng))]))
+
+;; ---------------------------------------------------------------------------
+;; Dictionary-based mutation: insert constants extracted from the target
+;; source into the input. This is how AFL finds magic bytes and keywords.
+
+;; Mutate a value using a dictionary entry. For strings, inserts or
+;; replaces a substring with a dictionary entry. For lists, inserts a
+;; dictionary entry as a new element.
+(define (mutate-with-dictionary val dictionary rng)
+  (cond
+    [(null? dictionary) val]
+    [(string? val)
+     (define entry (random-ref dictionary rng))
+     (define len (string-length val))
+     (define strategies
+       (list
+        ;; Insert dictionary entry at a random position
+        (lambda ()
+          (define pos (random 0 (add1 len) rng))
+          (string-append (substring val 0 pos) entry (substring val pos)))
+        ;; Replace a portion with the dictionary entry
+        (lambda ()
+          (define pos (random 0 (max 1 len) rng))
+          (define end (min len (+ pos (string-length entry))))
+          (string-append (substring val 0 pos) entry (substring val end)))
+        ;; Overwrite from a random position
+        (lambda ()
+          (define pos (random 0 (max 1 len) rng))
+          (string-append (substring val 0 pos) entry))))
+     ((random-ref strategies rng))]
+    [(list? val)
+     (define entry (random-ref dictionary rng))
+     (define pos (random 0 (add1 (length val)) rng))
+     (append (list-take val pos) (list entry) (list-drop val pos))]
+    [else val]))
+
+;; Extend a value with dictionary entries, producing multiple variants.
+;; For strings: insert dictionary entries at various positions, and also
+;; try concatenating pairs of entries to form plausible multi-token
+;; sequences (like "#b" + "1" or "#(" + "1" + ")").
+(define (extend-with-dictionary val dictionary rng)
+  (cond
+    [(string? val)
+     (define extensions '())
+     ;; Single entries: insert each at a random position
+     (for ([entry (in-list dictionary)])
+       (define pos (random 0 (add1 (string-length val)) rng))
+       (set! extensions
+             (cons (string-append (substring val 0 pos) entry (substring val pos))
+                   extensions)))
+     ;; Pairs: concatenate two dictionary entries and insert
+     (for ([_ (in-range (min 20 (length dictionary)))])
+       (define e1 (random-ref dictionary rng))
+       (define e2 (random-ref dictionary rng))
+       (define combined (string-append e1 e2))
+       (define pos (random 0 (add1 (string-length val)) rng))
+       (set! extensions
+             (cons (string-append (substring val 0 pos) combined (substring val pos))
+                   extensions)))
+     ;; Triples: three random entries concatenated
+     (for ([_ (in-range 20)])
+       (define e1 (random-ref dictionary rng))
+       (define e2 (random-ref dictionary rng))
+       (define e3 (random-ref dictionary rng))
+       (set! extensions
+             (cons (string-append e1 e2 e3) extensions)))
+     ;; Quads and quints: longer random dictionary concatenations
+     (for ([_ (in-range 20)])
+       (define n (+ 4 (random 0 3 rng)))
+       (define parts (for/list ([_ (in-range n)]) (random-ref dictionary rng)))
+       (set! extensions (cons (apply string-append parts) extensions)))
+     ;; Insert pairs/triples into the EXISTING value at random positions
+     (for ([_ (in-range 20)])
+       (define n (+ 2 (random 0 3 rng)))
+       (define combined (apply string-append
+                               (for/list ([_ (in-range n)])
+                                 (random-ref dictionary rng))))
+       (define pos (random 0 (add1 (string-length val)) rng))
+       (set! extensions
+             (cons (string-append (substring val 0 pos) combined (substring val pos))
+                   extensions)))
+     extensions]
+    [(list? val)
+     (for/list ([entry (in-list dictionary)])
+       (append val (list entry)))]
+    [else (list val)]))
 
 ;; ---------------------------------------------------------------------------
 ;; Structural list mutation: operates at the element level of the list

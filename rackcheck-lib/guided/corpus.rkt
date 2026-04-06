@@ -26,7 +26,8 @@
    iteration          ; when it was found
    parent             ; parent corpus-entry or #f
    energy             ; (box real?) — power schedule energy, mutable
-   offspring-count)   ; (box exact-nonneg-integer?)
+   offspring-count    ; (box exact-nonneg-integer?)
+   mutation-hint)     ; #f or (list 'position index) — what mutation produced this
   #:transparent)
 
 (struct corpus

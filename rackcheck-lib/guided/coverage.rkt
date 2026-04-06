@@ -19,6 +19,7 @@
 
 (require racket/path
          racket/fixnum
+         racket/list
          racket/unsafe/ops
          errortrace/errortrace-lib)
 
@@ -34,6 +35,7 @@
  coverage-summary              ; target-coverage-info? -> hash?
  target-coverage-info-global-bitmap
  target-coverage-info-boxes
+ target-coverage-info-dictionary
  )
 
 ;; ---------------------------------------------------------------------------
@@ -44,7 +46,8 @@
    num-points     ; exact-nonneg-integer?
    global-bitmap  ; bytes? — one byte per point, accumulates bucket bits
    snap-buffer    ; fxvector? — reusable buffer for snapshots
-   batch-buffer)  ; bytes? — reusable buffer for batch bitmaps
+   batch-buffer   ; bytes? — reusable buffer for batch bitmaps
+   dictionary)    ; (listof string?) — constants extracted from target source
   #:transparent)
 
 ;; ---------------------------------------------------------------------------
@@ -96,15 +99,43 @@
   (define boxes-vec (list->vector boxes))
   (define n (vector-length boxes-vec))
 
+  ;; Extract string/character constants from the target source
+  (define dict (extract-source-constants target))
+
   (define tci
     (target-coverage-info
      boxes-vec
      n
      (make-bytes n 0)       ; global bitmap
      (make-fxvector n 0)    ; snapshot buffer
-     (make-bytes n 0)))     ; batch bitmap buffer
+     (make-bytes n 0)       ; batch bitmap buffer
+     dict))                 ; dictionary
 
   (values ns tci))
+
+;; ---------------------------------------------------------------------------
+;; Dictionary extraction: scan source for string and character literals.
+;; These are "interesting" constants that mutations should try inserting.
+
+(define (extract-source-constants source-path)
+  (define strings '())
+  (with-handlers ([exn:fail? (lambda (_) '())])
+    (define stx
+      (parameterize ([read-accept-reader #t]
+                     [read-accept-lang #t])
+        (with-input-from-file source-path
+          (lambda ()
+            (port-count-lines! (current-input-port))
+            (read-syntax source-path)))))
+    (let walk ([s stx])
+      (cond
+        [(syntax? s) (walk (syntax-e s))]
+        [(string? s) (set! strings (cons s strings))]
+        [(char? s) (set! strings (cons (string s) strings))]
+        [(pair? s) (walk (car s)) (walk (cdr s))]
+        [(vector? s) (for ([e (in-vector s)]) (walk e))]
+        [else (void)])))
+  (remove-duplicates strings))
 
 ;; ---------------------------------------------------------------------------
 ;; AFL-style count bucket classification
