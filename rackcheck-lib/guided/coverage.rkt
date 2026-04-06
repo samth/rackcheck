@@ -38,38 +38,45 @@
 ;; module. Returns two values:
 ;; - the namespace (use it to dynamic-require functions from the target)
 ;; - a thunk that retrieves the current execute counts from that namespace
+;;
+;; Key: we do NOT attach errortrace from the current namespace, because
+;; doing so transitively brings in whatever errortrace depends on. If the
+;; target module is among those transitive deps (e.g. racket/treelist),
+;; it would already be loaded and wouldn't go through our source-load
+;; override. Instead, we set up errortrace's parameters directly from
+;; the outer namespace's already-loaded errortrace module.
 (define (make-instrumented-namespace target-path)
   (define target (simplify-path
                   (if (path? target-path) target-path
                       (string->path target-path))))
 
   (define ns (make-base-namespace))
-  (namespace-attach-module (current-namespace) 'errortrace/errortrace-lib ns)
-  (namespace-attach-module (current-namespace) 'errortrace/errortrace-key ns)
 
   (parameterize ([current-namespace ns])
-    (namespace-require 'errortrace/errortrace-lib)
-    ;; Create the compile handler INSIDE this namespace so it captures
-    ;; this namespace's module registry.
-    (eval '(begin
-             (execute-counts-enabled #t)
-             (current-compile (make-errortrace-compile-handler))))
-
-    ;; Override current-load/use-compiled so that the target module is
-    ;; loaded from source (triggering errortrace compilation) while all
-    ;; other modules load normally from .zo files.
+    ;; Install the load override FIRST, before anything that might
+    ;; transitively load the target module.
     (define orig-load/use-compiled (current-load/use-compiled))
+    (define target-loaded? #f)
     (current-load/use-compiled
      (lambda (path expected-module)
        (if (and (path? path)
+                (not target-loaded?)
                 (equal? (simplify-path path) target))
-           ((current-load) path expected-module)
-           (orig-load/use-compiled path expected-module)))))
+           (begin
+             (set! target-loaded? #t)
+             (parameterize ([current-load-relative-directory (path-only path)])
+               ((current-load) path expected-module)))
+           (orig-load/use-compiled path expected-module))))
 
-  ;; get-counts thunk — reads execute counts from the child namespace
+    ;; Set up errortrace instrumentation using the outer namespace's
+    ;; errortrace module (already loaded there). These are parameters
+    ;; so setting them affects the new namespace's compilation.
+    (execute-counts-enabled #t)
+    (current-compile (make-errortrace-compile-handler)))
+
+  ;; get-counts thunk — reads execute counts from the shared execute-info
   (define (get-counts)
-    (parameterize ([current-namespace ns])
-      (eval '(get-execute-counts))))
+    (get-execute-counts))
 
   (values ns get-counts))
 
