@@ -2,83 +2,65 @@
 
 ;; Coverage-guided property-based testing for rackcheck.
 ;;
-;; Extends rackcheck with a feedback loop: inputs that trigger new code
-;; coverage (via errortrace) are saved to a corpus and used to guide
-;; future generation via mutation.
+;; Extends rackcheck with a batched coverage feedback loop: inputs are
+;; generated in batches, run against the property, and the batch's
+;; collective coverage is checked. Batches that trigger new coverage
+;; are added to a corpus for further mutation.
 
-(require racket/contract/base
-         racket/set
-         racket/format
+(require racket/format
          "prop.rkt"
          "guided/config.rkt"
          "guided/coverage.rkt"
          "guided/corpus.rkt"
-         "guided/mutation.rkt"
          "guided/guidance.rkt")
 
 (provide
- ;; Configuration
- (contract-out
-  [make-guided-config
-   (->* []
-        [#:max-iterations exact-positive-integer?
-         #:max-time-ms (>=/c 0)
-         #:population-size exact-positive-integer?
-         #:mutation-rate (real-in 0 1)
-         #:seed exact-nonneg-integer?
-         #:verbose? boolean?]
-        guided-config?)]
-  [guided-config? (-> any/c boolean?)]
-
-  ;; Running guided checks
-  [check-guided
-   (->* [property?]
-        [#:config guided-config?
-         #:target path-string?]
-        guided-result?)]
-
-  ;; Results
-  [guided-result? (-> any/c boolean?)]
-  [guided-result-status (-> guided-result? symbol?)]
-  [guided-result-counterexample (-> guided-result? any/c)]
-  [guided-result-shrunk (-> guided-result? any/c)]
-  [guided-result-exception (-> guided-result? any/c)]
-  [guided-result-iterations (-> guided-result? exact-nonneg-integer?)]
-  [guided-result-corpus (-> guided-result? corpus?)]
-  [guided-result-seed (-> guided-result? exact-nonneg-integer?)]
-  [guided-result-coverage-summary (-> guided-result? hash?)]
-  [guided-result-new-points-found (-> guided-result? exact-nonneg-integer?)]
-
-  ;; Corpus inspection
-  [corpus? (-> any/c boolean?)]
-  [corpus-entries (-> corpus? list?)]
-  [corpus-size (-> corpus? exact-nonneg-integer?)]
-  [corpus-entry? (-> any/c boolean?)]
-  [corpus-entry-input (-> corpus-entry? any/c)]
-  [corpus-entry-coverage-sig (-> corpus-entry? set?)]
-  [corpus-entry-iteration (-> corpus-entry? exact-nonneg-integer?)]
-  [corpus-entry-parent (-> corpus-entry? (or/c #f corpus-entry?))]
-
-  ;; Replay
-  [replay-input (-> property? list? any/c)]
-
-  ;; Reporting
-  [print-guided-result (-> guided-result? void?)]
-
-  ;; rackunit integration
-  [check-guided-property
-   (->* [property?]
-        [#:config guided-config?
-         #:target path-string?]
-        void?)]))
-
-(define (exact-nonneg-integer? v)
-  (and (exact-integer? v) (>= v 0)))
+ make-guided-config
+ guided-config?
+ check-guided
+ ;; For callers who want to set up their own instrumented namespace
+ ;; and pass the tci directly to check-guided #:target
+ make-instrumented-namespace
+ target-coverage-info?
+ target-coverage-info-num-points
+ target-coverage-info-boxes
+ target-coverage-info-global-bitmap
+ snapshot-target!
+ compute-batch-bitmap!
+ bitmap-has-new-coverage?
+ merge-bitmap!
+ count-new-bits
+ coverage-summary
+ guided-result?
+ guided-result-status
+ guided-result-counterexample
+ guided-result-shrunk
+ guided-result-exception
+ guided-result-iterations
+ guided-result-corpus
+ guided-result-seed
+ guided-result-coverage-summary
+ guided-result-new-coverage-bits
+ corpus?
+ corpus-entries
+ corpus-size
+ corpus-entry?
+ corpus-entry-input
+ corpus-entry-iteration
+ corpus-entry-parent
+ replay-input
+ print-guided-result
+ check-guided-property)
 
 (define (check-guided prop
                       #:config [config (make-guided-config)]
                       #:target [target #f])
-  (run-guided config prop (and target (if (path? target) target (string->path target)))))
+  (run-guided config prop
+              (cond
+                [(target-coverage-info? target) target]
+                [(path? target) target]
+                [(string? target) (string->path target)]
+                [else #f])))
 
 (define (replay-input p args)
   (define f (property-proc p))
@@ -87,14 +69,19 @@
 
 (define (print-guided-result res)
   (define status (guided-result-status res))
+  (define summary (guided-result-coverage-summary res))
   (printf "Coverage-guided testing result:\n")
   (printf "  Status: ~a\n" status)
   (printf "  Iterations: ~a\n" (guided-result-iterations res))
   (printf "  Seed: ~a\n" (guided-result-seed res))
   (printf "  Corpus size: ~a\n" (corpus-size (guided-result-corpus res)))
-  (printf "  New coverage points found: ~a\n" (guided-result-new-points-found res))
-  (printf "  Total coverage points: ~a\n"
-          (hash-count (guided-result-coverage-summary res)))
+  (printf "  New coverage bits: ~a\n" (guided-result-new-coverage-bits res))
+  (printf "  Coverage: ~a/~a (~a%)\n"
+          (hash-ref summary 'covered 0)
+          (hash-ref summary 'total 0)
+          (if (hash-ref summary 'percent #f)
+              (real->decimal-string (hash-ref summary 'percent) 1)
+              "?"))
   (case status
     [(falsified)
      (printf "  Counterexample: ~s\n" (guided-result-counterexample res))
@@ -125,8 +112,9 @@
              (property-name prop)
              (guided-result-iterations res))]
     [(passed)
-     (printf "  ✓ property ~a passed ~a guided iterations (corpus: ~a, new coverage: ~a)\n"
+     (printf "  ✓ property ~a passed ~a guided iterations (corpus: ~a, coverage: ~a/~a)\n"
              (property-name prop)
              (guided-result-iterations res)
              (corpus-size (guided-result-corpus res))
-             (guided-result-new-points-found res))]))
+             (hash-ref (guided-result-coverage-summary res) 'covered 0)
+             (hash-ref (guided-result-coverage-summary res) 'total 0))]))

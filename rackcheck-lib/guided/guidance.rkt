@@ -1,16 +1,15 @@
 #lang racket/base
 
-;; The core coverage-guided testing loop.
+;; Coverage-guided testing loop with batched coverage feedback.
 ;;
-;; This is an alternative to rackcheck's built-in `check` function that adds
-;; a coverage feedback loop: inputs that trigger new code coverage are saved
-;; to a corpus and used to guide future generation via mutation.
+;; Instead of checking coverage after every test, we generate a batch
+;; of inputs, run them all, then check coverage once for the whole
+;; batch. This amortizes the snapshot cost and makes the guidance loop
+;; nearly as fast as plain rackcheck.
 ;;
 ;; Uses only rackcheck's public API — no private submodule access.
 
-(require racket/contract/base
-         racket/match
-         racket/set
+(require racket/match
          racket/random
          racket/stream
          "../prop.rkt"
@@ -22,67 +21,48 @@
          "shrinking.rkt")
 
 (provide
- (contract-out
-  [struct guided-result
-    ([status symbol?]
-     [iterations exact-nonnegative-integer?]
-     [counterexample any/c]
-     [shrunk any/c]
-     [exception any/c]
-     [corpus corpus?]
-     [seed exact-nonnegative-integer?]
-     [coverage-summary hash?]
-     [new-points-found exact-nonnegative-integer?])]
-  [run-guided (-> guided-config? property? (or/c #f path-string?) guided-result?)]))
+ (struct-out guided-result)
+ run-guided)
 
 (struct guided-result
   (status iterations counterexample shrunk exception
-   corpus seed coverage-summary new-points-found)
+   corpus seed coverage-summary new-coverage-bits)
   #:transparent)
 
 ;; Main entry point for guided testing.
-;; `target-path` is the path to the module being tested (for instrumentation).
-;; If #f, coverage feedback is collected for whatever is already instrumented.
-(define (run-guided gconfig p target-path)
+;; `target` can be:
+;;   - a path-string? → creates an instrumented namespace for that module
+;;   - a target-coverage-info? → uses the caller's pre-built coverage tracking
+;;   - #f → no coverage guidance (just runs tests)
+(define (run-guided gconfig p target)
   (match-define (guided-config max-iters max-time-ms pop-size
                                mutation-rate seed verbose?) gconfig)
 
-  ;; Extract the generator and test function via public accessors
   (define g (property-gen p))
   (define f (property-proc p))
 
-  ;; Set up instrumentation via namespace isolation.
-  ;; get-counts reads execute counts from the instrumented namespace.
-  ;; instrumented-ns is the namespace where the target was compiled with
-  ;; errortrace — we parameterize current-namespace to it when running
-  ;; the property so that dynamic-require calls in the property body
-  ;; resolve to the instrumented version of the target.
-  (define-values (get-counts instrumented-ns)
-    (if target-path
-        (let-values ([(ns gc) (make-instrumented-namespace target-path)])
-          (parameterize ([current-namespace ns])
-            (dynamic-require
-             (if (path? target-path) target-path (string->path target-path))
-             #f))
-          (values gc ns))
-        (values (lambda () '()) #f)))
+  ;; Set up coverage tracking.
+  (define-values (instrumented-ns tci)
+    (cond
+      [(target-coverage-info? target)
+       (values #f target)]
+      [(or (string? target) (path? target))
+       (make-instrumented-namespace target)]
+      [else
+       (values #f #f)]))
 
-  ;; Set up RNG
+  ;; RNG setup
   (define rng (make-pseudo-random-generator))
   (parameterize ([current-pseudo-random-generator rng])
     (random-seed seed))
-
-  ;; Caller's RNG for property evaluation (rackcheck convention)
   (define caller-rng (current-pseudo-random-generator))
 
   (define corp (make-corpus))
   (define start-time (current-inexact-milliseconds))
-  (define total-new-points 0)
+  (define total-new-bits 0)
+  (define batch-size (max 1 (min pop-size 100)))
 
-  ;; Helper: run property on a list of arguments.
-  ;; Returns (values passed? exception-or-#f)
-  ;; Runs in the instrumented namespace (if any) so that dynamic-require
-  ;; calls in the property body resolve to the instrumented target.
+  ;; Run property on a list of arguments.
   (define (test-input args)
     (with-handlers ([exn:fail? (lambda (e) (values #f e))])
       (parameterize ([current-pseudo-random-generator caller-rng]
@@ -92,132 +72,192 @@
             (values #t #f)
             (values #f #f)))))
 
-  ;; Helper: generate a fresh input from the property's generator.
-  ;; Returns (values args shrink-tree)
+  ;; Generate a fresh input from the property's generator.
   (define (generate-fresh size)
     (define tree (g rng size))
-    (define args (shrink-tree-val tree))
-    (values args tree))
+    (values (shrink-tree-val tree) tree))
 
-  ;; Helper: mutate a corpus entry's input.
+  ;; Mutate a corpus entry's input.
   (define (mutate-from-corpus)
     (define entry (corpus-pick corp rng))
     (cond
       [entry
+       (set-box! (corpus-entry-offspring-count entry)
+                 (add1 (unbox (corpus-entry-offspring-count entry))))
        (define old-input (corpus-entry-input entry))
        (define new-input
          (cond
+           ;; List of lists (operation sequences) → structural mutation 70%
+           [(and (list? old-input) (not (null? old-input))
+                 (andmap list? old-input))
+            (if (< (random rng) 0.7)
+                (mutate-list-structurally old-input rng)
+                ;; Fall back to single-element value mutation
+                (let ([idx (random 0 (length old-input) rng)])
+                  (define v (list->vector old-input))
+                  (vector-set! v idx (mutate-value (vector-ref v idx) rng))
+                  (vector->list v)))]
+           ;; Plain list → element-level mutation
            [(and (list? old-input) (not (null? old-input)))
-            (define idx (random 0 (length old-input) rng))
-            (define mutated (mutate-value (list-ref old-input idx) rng))
-            (append (take-n old-input idx)
-                    (list mutated)
-                    (drop-n old-input (add1 idx)))]
+            (let ([idx (random 0 (length old-input) rng)])
+              (define v (list->vector old-input))
+              (vector-set! v idx (mutate-value (vector-ref v idx) rng))
+              (vector->list v))]
            [else (mutate-value old-input rng)]))
        (values new-input entry)]
       [else (values #f #f)]))
 
-  ;; Helper: splice two corpus entries
-  (define (splice-from-corpus)
-    (define e1 (corpus-pick corp rng))
-    (define e2 (corpus-pick corp rng))
-    (cond
-      [(and e1 e2
-            (list? (corpus-entry-input e1))
-            (list? (corpus-entry-input e2)))
-       (define in1 (corpus-entry-input e1))
-       (define in2 (corpus-entry-input e2))
-       (define spliced
-         (for/list ([a (in-list in1)]
-                    [b (in-list in2)])
-           (splice-values a b rng)))
-       (values spliced e1)]
-      [else (values #f #f)]))
-
-  ;; Helper: compute size for iteration n
+  ;; Compute size for iteration n
   (define (iter-size n)
     (min 1000 (expt (add1 (modulo n 50)) 2)))
 
-  ;; The main loop
-  (define (loop iteration last-tree)
+  ;; --- The main batched loop ---
+  (define (run-loop iteration)
     (cond
       [(>= iteration max-iters)
        (make-result 'passed iteration)]
       [(>= (current-inexact-milliseconds) (+ start-time max-time-ms))
        (make-result 'timed-out iteration)]
       [else
-       (when (and verbose? (zero? (modulo iteration 100)))
-         (eprintf "guided: iteration ~a, corpus size ~a, coverage points ~a\n"
-                  iteration (corpus-size corp) (set-count (corpus-global-coverage corp))))
+       (when (and verbose? (zero? (modulo iteration (* batch-size 10))))
+         (define summary (and tci (coverage-summary tci)))
+         (eprintf "guided: iteration ~a, corpus ~a, coverage ~a/~a (~a%)\n"
+                  iteration (corpus-size corp)
+                  (if summary (hash-ref summary 'covered) "?")
+                  (if summary (hash-ref summary 'total) "?")
+                  (if summary
+                      (real->decimal-string (hash-ref summary 'percent) 1)
+                      "?")))
 
-       (define use-mutation?
-         (and (> (corpus-size corp) 0)
-              (< (random rng) mutation-rate)))
+       ;; Snapshot coverage before this batch
+       (define snap (and tci (snapshot-target! tci)))
 
-       (define-values (args parent-entry current-tree)
-         (cond
-           [use-mutation?
-            (define-values (mutated parent)
-              (if (and (< (random rng) 0.2) (>= (corpus-size corp) 2))
-                  (splice-from-corpus)
-                  (mutate-from-corpus)))
-            (if mutated
-                (values mutated parent #f)
-                (let-values ([(a t) (generate-fresh (iter-size iteration))])
-                  (values a #f t)))]
-           [else
-            (define-values (a t) (generate-fresh (iter-size iteration)))
-            (values a #f t)]))
+       ;; Generate and run a batch of inputs
+       (define actual-batch-size
+         (min batch-size (- max-iters iteration)))
 
-       (define before (snapshot-coverage get-counts))
-       (define-values (passed? exn) (test-input args))
-       (define after (snapshot-coverage get-counts))
-       (define diff (diff-coverage before after))
-       (define sig (coverage-signature diff))
-       (define sh (coverage-sig-hash sig))
+       ;; Collect batch inputs, their parents, and their trees (for shrinking)
+       (define batch-inputs (make-vector actual-batch-size #f))
+       (define batch-parents (make-vector actual-batch-size #f))
+       (define batch-trees (make-vector actual-batch-size #f))
+       (define batch-passed (make-vector actual-batch-size #t))
+       (define batch-exns (make-vector actual-batch-size #f))
+       (define failure-idx #f)
 
-       (when (and (not (set-empty? sig))
-                  (corpus-interesting? corp diff before))
-         (define new-points (set-subtract sig (corpus-global-coverage corp)))
-         (define entry
-           (corpus-entry args
-                         (if passed? #t #f)
-                         sig sh iteration
-                         parent-entry))
-         (corpus-add! corp entry)
-         (set! total-new-points (+ total-new-points (set-count new-points)))
-         (when verbose?
-           (eprintf "  interesting input at iteration ~a (new coverage: ~a points)\n"
-                    iteration (set-count new-points))))
+       (for ([i (in-range actual-batch-size)]
+             #:break failure-idx)
+         (define use-mutation?
+           (and (> (corpus-size corp) 0)
+                (< (random rng) mutation-rate)))
 
+         (define-values (args parent-entry tree)
+           (cond
+             [use-mutation?
+              (define-values (mutated parent) (mutate-from-corpus))
+              (if mutated
+                  (values mutated parent #f)
+                  (let-values ([(a t) (generate-fresh (iter-size (+ iteration i)))])
+                    (values a #f t)))]
+             [else
+              (define-values (a t) (generate-fresh (iter-size (+ iteration i))))
+              (values a #f t)]))
+
+         (vector-set! batch-inputs i args)
+         (vector-set! batch-parents i parent-entry)
+         (vector-set! batch-trees i tree)
+
+         (define-values (passed? exn) (test-input args))
+         (vector-set! batch-passed i passed?)
+         (vector-set! batch-exns i exn)
+
+         (unless passed?
+           (set! failure-idx i)))
+
+       ;; If a failure was found, handle it immediately
        (cond
-         [(not passed?)
+         [failure-idx
           (when verbose?
-            (eprintf "guided: failure found at iteration ~a\n" iteration))
+            (eprintf "guided: failure at iteration ~a\n"
+                     (+ iteration failure-idx)))
+          (define args (vector-ref batch-inputs failure-idx))
+          (define tree (vector-ref batch-trees failure-idx))
+          (define exn (vector-ref batch-exns failure-idx))
           (define shrunk
             (cond
-              [current-tree
-               (descend-shrinks (shrink-tree-shrinks current-tree)
+              [tree
+               (descend-shrinks (shrink-tree-shrinks tree)
                                 args
-                                (lambda (a) (let-values ([(p _) (test-input a)]) p)))]
+                                (lambda (a)
+                                  (let-values ([(p _) (test-input a)]) p)))]
               [else
                (shrink-failing-input
                 args
-                (lambda (a) (let-values ([(p _) (test-input a)]) (not p)))
+                (lambda (a)
+                  (let-values ([(p _) (test-input a)]) (not p)))
                 100)]))
-          (make-result 'falsified iteration args shrunk exn)]
-         [else
-          (loop (add1 iteration) current-tree)])]))
+          (make-result 'falsified (+ iteration failure-idx)
+                       args shrunk exn)]
+         [tci
+          (define batch-bitmap (compute-batch-bitmap! tci snap))
+          (define global-bitmap (target-coverage-info-global-bitmap tci))
+          (define interesting? (bitmap-has-new-coverage? batch-bitmap global-bitmap))
 
-  (define (make-result status iteration [args #f] [shrunk #f] [exn #f])
+          (when interesting?
+            (define new-bits (count-new-bits batch-bitmap global-bitmap))
+            (merge-bitmap! batch-bitmap global-bitmap)
+            (set! total-new-bits (+ total-new-bits new-bits))
+
+            ;; Add all inputs from this batch to the corpus
+            (for ([i (in-range actual-batch-size)])
+              (when (vector-ref batch-passed i)
+                (define entry
+                  (corpus-entry (vector-ref batch-inputs i)
+                                #t
+                                new-bits
+                                (+ iteration i)
+                                (vector-ref batch-parents i)
+                                (box (exact->inexact new-bits))
+                                (box 0)))
+                (corpus-add! corp entry)))
+
+            ;; Boost parent energy for parents in this batch
+            (for ([i (in-range actual-batch-size)])
+              (define parent (vector-ref batch-parents i))
+              (when parent (corpus-boost-energy! parent new-bits)))
+
+            (when verbose?
+              (eprintf "  batch ~a-~a: ~a new coverage bits, corpus now ~a\n"
+                       iteration (+ iteration actual-batch-size -1)
+                       new-bits (corpus-size corp))))
+
+          (unless interesting?
+            ;; Decay parents that didn't produce interesting offspring
+            (for ([i (in-range actual-batch-size)])
+              (define parent (vector-ref batch-parents i))
+              (when parent (corpus-decay-energy! parent))))
+
+          (run-loop (+ iteration actual-batch-size))]
+
+         ;; No instrumentation — just continue
+         [else
+          (run-loop (+ iteration actual-batch-size))])]))
+
+  ;; Result constructor
+  (define (make-result status iteration
+                       [args #f] [shrunk #f] [exn #f])
     (guided-result status iteration args shrunk exn
                    corp seed
-                   (snapshot-coverage get-counts)
-                   total-new-points))
+                   (if tci (coverage-summary tci) (hash))
+                   total-new-bits))
 
-  (loop 0 #f))
+  ;; Run
+  (define result (run-loop 0))
 
-;; Descend a rackcheck shrink tree to find the smallest failing input.
+  ;; Handle the case where run-loop returned void (failure was handled inline)
+  (if (guided-result? result) result
+      (make-result 'passed max-iters)))
+
+;; Descend a rackcheck shrink tree.
 (define (descend-shrinks trees last-failing-value pass?)
   (cond
     [(stream-empty? trees) last-failing-value]
@@ -227,11 +267,3 @@
      (if (pass? value)
          (descend-shrinks (stream-rest trees) last-failing-value pass?)
          (descend-shrinks (shrink-tree-shrinks tree) value pass?))]))
-
-(define (take-n lst n)
-  (cond [(or (zero? n) (null? lst)) '()]
-        [else (cons (car lst) (take-n (cdr lst) (sub1 n)))]))
-
-(define (drop-n lst n)
-  (cond [(or (zero? n) (null? lst)) lst]
-        [else (drop-n (cdr lst) (sub1 n))]))

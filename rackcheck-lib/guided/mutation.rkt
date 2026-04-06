@@ -13,7 +13,8 @@
 (provide
  (contract-out
   [mutate-value (-> any/c pseudo-random-generator? any/c)]
-  [splice-values (-> any/c any/c pseudo-random-generator? any/c)]))
+  [splice-values (-> any/c any/c pseudo-random-generator? any/c)]
+  [mutate-list-structurally (-> list? pseudo-random-generator? list?)]))
 
 ;; Dispatch mutation by type.
 (define (mutate-value val rng)
@@ -232,3 +233,62 @@
     (vector-set! vec i (vector-ref vec j))
     (vector-set! vec j tmp))
   (vector->list vec))
+
+;; ---------------------------------------------------------------------------
+;; Structural list mutation: operates at the element level of the list
+;; (e.g., entire operations in a list-of-operations input) rather than
+;; mutating individual values within elements.
+
+(define (mutate-list-structurally lst rng)
+  (define len (length lst))
+  (cond
+    [(< len 2) lst]
+    [else
+     (define strategies
+       (list
+        ;; Delete a contiguous chunk of 1-5 elements
+        (lambda ()
+          (define chunk-size (min (add1 (random 0 5 rng)) len))
+          (define start (random 0 (max 1 (- len chunk-size -1)) rng))
+          (append (list-take lst start)
+                  (list-drop lst (min len (+ start chunk-size)))))
+
+        ;; Duplicate a contiguous chunk (extend the sequence)
+        (lambda ()
+          (define chunk-size (min (add1 (random 0 5 rng)) len))
+          (define start (random 0 (max 1 (- len chunk-size -1)) rng))
+          (define chunk
+            (list-take (list-drop lst start) (min chunk-size (- len start))))
+          (define insert-pos (random 0 (add1 len) rng))
+          (append (list-take lst insert-pos) chunk (list-drop lst insert-pos)))
+
+        ;; Swap two elements
+        (lambda ()
+          (define i (random 0 len rng))
+          (define j (random 0 len rng))
+          (if (= i j) lst
+              (let ([a (list-ref lst i)] [b (list-ref lst j)])
+                (define v (list->vector lst))
+                (vector-set! v i b)
+                (vector-set! v j a)
+                (vector->list v))))
+
+        ;; Replace one element with a copy of another
+        (lambda ()
+          (define src (random 0 len rng))
+          (define dst (random 0 len rng))
+          (if (= src dst) lst
+              (append (list-take lst dst)
+                      (list (list-ref lst src))
+                      (list-drop lst (add1 dst)))))
+
+        ;; For list-of-lists: mutate just the first element (selector) of one tuple
+        (lambda ()
+          (define idx (random 0 len rng))
+          (define elem (list-ref lst idx))
+          (if (and (list? elem) (>= (length elem) 1) (integer? (car elem)))
+              (append (list-take lst idx)
+                      (list (cons (random 0 34 rng) (cdr elem)))
+                      (list-drop lst (add1 idx)))
+              lst))))
+     ((random-ref strategies rng))]))

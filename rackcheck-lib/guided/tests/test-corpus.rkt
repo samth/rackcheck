@@ -1,46 +1,25 @@
 #lang racket/base
 
-;; Tests for corpus management and interestingness.
+;; Tests for corpus management with power schedule.
 
 (require rackunit
-         racket/set
-         rackcheck/guided/corpus
-         rackcheck/guided/coverage)
+         rackcheck/guided/corpus)
 
 (test-case "make-corpus creates empty corpus"
   (define c (make-corpus))
   (check-equal? (corpus-size c) 0)
-  (check-equal? (corpus-entries c) '())
-  (check-true (set-empty? (corpus-global-coverage c))))
+  (check-equal? (corpus-entries c) '()))
 
 (test-case "corpus-add! adds entries"
   (define c (make-corpus))
-  (define sig (set '("f" 1 5)))
-  (define entry (corpus-entry '(42) #t sig (coverage-sig-hash sig) 0 #f))
+  (define entry (corpus-entry '(42) #t 5 0 #f (box 5.0) (box 0)))
   (corpus-add! c entry)
-  (check-equal? (corpus-size c) 1)
-  (check-equal? (set-count (corpus-global-coverage c)) 1))
-
-(test-case "corpus-interesting? detects new coverage"
-  (define c (make-corpus))
-  ;; Add entry covering point A
-  (define sig-a (set '("f" 1 5)))
-  (corpus-add! c (corpus-entry '(1) #t sig-a (coverage-sig-hash sig-a) 0 #f))
-
-  ;; Diff that covers point B (new)
-  (define diff-b (hash '("f" 2 3) 1))
-  (check-true (corpus-interesting? c diff-b (hash)))
-
-  ;; Diff that covers only point A (not new)
-  (define diff-a (hash '("f" 1 5) 1))
-  ;; Still interesting because of novel sig hash
-  (check-true (corpus-interesting? c diff-a (hash))))
+  (check-equal? (corpus-size c) 1))
 
 (test-case "corpus-pick returns an entry"
   (define c (make-corpus))
-  (define sig (set '("f" 1 5)))
-  (corpus-add! c (corpus-entry '(1) #t sig 0 0 #f))
-  (corpus-add! c (corpus-entry '(2) #t sig 1 1 #f))
+  (corpus-add! c (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0)))
+  (corpus-add! c (corpus-entry '(2) #t 5 1 #f (box 5.0) (box 0)))
   (define rng (make-pseudo-random-generator))
   (parameterize ([current-pseudo-random-generator rng])
     (random-seed 42))
@@ -52,14 +31,29 @@
   (define rng (make-pseudo-random-generator))
   (check-false (corpus-pick c rng)))
 
-(test-case "corpus-best-entries returns sorted entries"
+(test-case "corpus-boost-energy! increases energy"
+  (define entry (corpus-entry '(1) #t 3 0 #f (box 3.0) (box 0)))
+  (corpus-boost-energy! entry 5)
+  (check-equal? (unbox (corpus-entry-energy entry)) 8.0))
+
+(test-case "corpus-decay-energy! decreases energy"
+  (define entry (corpus-entry '(1) #t 3 0 #f (box 10.0) (box 0)))
+  (corpus-decay-energy! entry)
+  (check-equal? (unbox (corpus-entry-energy entry)) 9.5))
+
+(test-case "power schedule favors high-energy entries"
   (define c (make-corpus))
-  (define sig1 (set '("f" 1 5)))
-  (define sig2 (set '("f" 1 5) '("f" 2 3) '("f" 3 1)))
-  (corpus-add! c (corpus-entry '(1) #t sig1 0 0 #f))
-  (corpus-add! c (corpus-entry '(2) #t sig2 1 1 #f))
-  (define best (corpus-best-entries c 1))
-  (check-equal? (length best) 1)
-  (check-equal? (corpus-entry-input (car best)) '(2)))
+  (corpus-add! c (corpus-entry '(a) #t 10 0 #f (box 100.0) (box 0)))
+  (corpus-add! c (corpus-entry '(b) #t 1 1 #f (box 0.1) (box 10)))
+  (define rng (make-pseudo-random-generator))
+  (parameterize ([current-pseudo-random-generator rng])
+    (random-seed 42))
+  (define counts (make-hash))
+  (for ([_ 100])
+    (define picked (corpus-pick c rng))
+    (define key (corpus-entry-input picked))
+    (hash-update! counts key add1 0))
+  (check-true (> (hash-ref counts '(a) 0) (hash-ref counts '(b) 0))
+              "High-energy entry should be picked more often"))
 
 (printf "All corpus tests passed.\n")
